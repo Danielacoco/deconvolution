@@ -1,0 +1,203 @@
+import argparse
+import numpy as np
+import os
+import glob
+from scipy.signal import fftconvolve
+import matplotlib.pyplot as plt
+import tifffile
+from psf_generator import ScalarSphericalPropagator
+
+
+def pad_kernel(kernel, target_shape):
+    """
+    Pad a kernel array to the target shape with zeros, centering the original kernel.
+    
+    Parameters:
+        kernel (np.ndarray): The kernel to be padded.
+        target_shape (tuple): The desired output shape.
+    
+    Returns:
+        np.ndarray: Padded kernel with shape equal to target_shape.
+    """
+    padded = np.zeros(target_shape, dtype=kernel.dtype)
+    kernel_shape = kernel.shape
+    start_indices = [(t - k) // 2 for t, k in zip(target_shape, kernel_shape)]
+    slices = tuple(slice(start, start + k) for start, k in zip(start_indices, kernel_shape))
+    padded[slices] = kernel
+    return padded
+
+def simulate_microscopy_image(data, psf, sigma_g, alpha_p):
+    """
+    Simulate a microscopy image by convolving 3D data with a PSF and adding noise.
+    
+    Parameters:
+        data (np.ndarray): 3D image data.
+        psf (np.ndarray): 3D point spread function.
+        sigma_g (float): Standard deviation for Gaussian noise.
+        alpha_p (float): Scaling factor to convert intensities into photon counts for Poisson noise.
+    
+    Returns:
+        np.ndarray: Simulated noisy image.
+    """
+    # Convolve the data with the PSF using FFT-based convolution.
+    convolved = fftconvolve(data, psf, mode='same')
+    
+    # Apply Poisson (shot) noise.
+    scaled = convolved * alpha_p
+    scaled[scaled < 0] = 0
+    poisson_noisy = np.random.poisson(scaled) / alpha_p
+    
+    # Add Gaussian (read) noise.
+    gaussian_noise = np.random.normal(loc=0.0, scale=sigma_g, size=convolved.shape)
+    
+    simulated_image = poisson_noisy + gaussian_noise
+    return simulated_image
+
+def load_ome_tif(filename):
+    """
+    load 3D data from an OME-TIFF file.
+    """
+    return tifffile.imread(filename) #np.ndarray
+
+def load_data(filename):
+    """
+    helper to load 3D data from a .npy file.
+    """
+    return np.load(filename)
+
+def save_data(filename, data):
+    """
+    Save data to a .npy file.
+    """
+    np.save(filename, data)
+
+def save_ome_tiff(filename, data):
+    """
+    Save data to an OME-TIFF file.
+    """
+    tifffile.imwrite(filename, data)
+
+def generate_default_psf():
+    """
+    Generate a default PSF using the PSF generator using Vasilikis example
+  
+    """
+    kwargs = {
+        'n_pix_pupil': 127,    # Number of pixels for the pupil function
+        'n_pix_psf': 256,      # Number of pixels for the PSF
+        'na': 1.3,             # Numerical aperture
+        'wavelength': 480,     # Wavelength in nm
+        'fov': 25600,          # Field of view in nm
+        'defocus_min': -5000,  # Minimum defocus in nm
+        'defocus_max': 5000,   # Maximum defocus in nm
+        'n_defocus': 101,      # Number of defocus slices
+    }
+    propagator = ScalarSphericalPropagator(**kwargs)
+    focus_field = propagator.compute_focus_field()
+    psf = np.abs(focus_field).squeeze()**2
+    return psf
+
+def process_file(input_file, output_dir, psf, sigma_g, alpha_p, pad_psf, visualize):
+    """
+    Process a single OME-TIFF file.
+    
+    Parameters:
+        input_file (str): Path to the input OME-TIFF file.
+        output_dir (str): Directory where the output files will be saved.
+        psf (np.ndarray): PSF to use for convolution.
+        sigma_g (float): Gaussian noise standard deviation.
+        alpha_p (float): Scaling factor for Poisson noise.
+        pad_psf (bool): Whether to pad the PSF to match sample dimensions.
+        visualize (bool): Whether to visualize the middle slice.
+    """
+    data = load_ome_tif(input_file)
+    basename = os.path.splitext(os.path.basename(input_file))[0]
+    npy_output_file = os.path.join(output_dir, f"{basename}_simulated.npy")
+    tiff_output_file = os.path.join(output_dir, f"{basename}_simulated.ome.tif")
+    
+    if pad_psf:
+        psf = pad_kernel(psf, data.shape)
+        print(f"PSF padded to match sample dimensions: {data.shape}")
+    
+    simulated = simulate_microscopy_image(data, psf, sigma_g, alpha_p)
+    save_data(npy_output_file, simulated)
+    save_ome_tiff(tiff_output_file, simulated)
+    print(f"Simulated image saved to {npy_output_file}")
+    print(f"Simulated OME-TIFF saved to {tiff_output_file}")
+    
+    if visualize:
+        slice_index = simulated.shape[0] // 2
+        plt.imshow(simulated[slice_index, :, :], cmap='gray')
+        plt.title(f"Simulated Image (Slice at index {slice_index}) for {basename}")
+        plt.colorbar()
+        plt.show()
+
+def parse_arguments():
+    """
+    Parse command-line arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description="Simulator to model microscopy images using 3D data. The simulator takes in 3D data (the sample), convolves it with a PSF generated by the PSF generator, and adds Gaussian and Poisson noise using parameters alpha_g and alpha_p."
+    )
+    parser.add_argument('--input', type=str,
+                        help='Input one 3D data file (.ome.tif) format).')
+    parser.add_argument('--input_dir', type=str,
+                        help='Input directory containing OME-TIFF files (.ome.tif). All such files will be processed.')
+    parser.add_argument('--psf', type=str,
+                        help='PSF file (.npy format). If not provided, a default PSF will be generated using the PSF generator.')
+    parser.add_argument('--output_dir', type=str, default='simulated_images',
+                        help='Output directory where the simulated images will be saved (used when processing multiple files).')
+    parser.add_argument('--sigma_g', type=float, default=0.05,
+                        help='Gaussian noise standard deviation (read noise).')
+    parser.add_argument('--alpha_p', type=float, default=100.0,
+                        help='Scaling factor for converting intensities into photon counts (shot noise).')
+    parser.add_argument('--visualize', action='store_true',
+                        help='Display a middle slice of the simulated image.')
+    parser.add_argument('--pad_psf', action='store_true',
+                        help='Pad the PSF to match the sample dimensions.')
+    return parser.parse_args()
+
+def main():
+    args = parse_arguments()
+
+    # Check that at least one input option is provided.
+    if not args.input and not args.input_dir:
+        print("Error: You must provide either --input or --input_dir.")
+        return
+    
+    # Create output directory.
+    if args.input_dir or args.input:
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
+
+    # Load or generate the PSF.
+    if args.psf:
+        psf = load_data(args.psf) #expecting .npy file
+    else:
+        psf = generate_default_psf()
+
+    # If --input is provided we only porcess that single single file.
+    if args.input:
+        print("Processing single file as --input argument was provided. Pricessing only one input file")
+        ext = os.path.splitext(args.input)[1].lower()
+        if ext not in ['.ome.tif', '.ome.tiff']: #rn only supporting .ome.tif files
+            print(f"Error: --input file must be an OME-TIFF file (.ome.tif or .ome.tiff). Provided: {ext}")
+            return
+        process_file(args.input, args.output_dir, psf, args.sigma_g, args.alpha_p, args.pad_psf, args.visualize)
+    # If processing all OME-TIFF files in a directory.
+    elif args.input_dir:
+        ome_files = glob.glob(os.path.join(args.input_dir, '*.ome.tif')) #final all files to process
+        if not ome_files:
+            print("No .ome.tif files found in the provided directory.")
+            return
+        for file in ome_files:
+            print(f"Processing {file}...")
+            process_file(file, args.output_dir, psf, args.sigma_g, args.alpha_p, args.pad_psf, false)
+        return
+    # If no input provided, generate dummy data.
+    else:
+        print("No input file or directory provided!")
+        return
+
+if __name__ == '__main__':
+    main()

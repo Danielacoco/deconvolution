@@ -1,2 +1,4 @@
 data/
 Miniconda3-latest-Linux-x86_64.sh
+psf/
+__pycache__/simulator.cpython-39.pyc
